@@ -70,14 +70,18 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
         uint256 size;
         uint256 startTime;
         uint256 rewardAquired;
+        uint256 lastClaimedRewards;
     }
 
     IERC20 public token;
     IERC20 public devUSDC;
+    uint256 public totalAmountStakedInContract;
     uint256 public rewardRate = 10; // for 10% yearly reward
     uint256 public totalStaked;
     uint256 public stakeLockPeriod = 7 days;
     bool contractPaused = false;
+
+    address[] users;
 
     /*//////////////////////////////////////////////////////////////////////////
                                 PRIVATE STORAGE
@@ -146,7 +150,10 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
         Stake memory stakePosition = _stakes[msg.sender][_stakeCount[msg.sender]];
         stakePosition.size += amount;
         stakePosition.startTime = block.timestamp;
+        stakePosition.lastClaimedRewards = block.timestamp;
         _stakeCount[msg.sender] += 1;
+        totalAmountStakedInContract += amount;
+        users.push(msg.sender);
 
         bool success = IERC20(token).transferFrom(msg.sender, address(this), amount);
         if (!success) {
@@ -176,6 +183,7 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
         stakePosition.rewardAquired = _calculateRewards(msg.sender, stakeId);
         stakePosition.size += amount;
         stakePosition.startTime = block.timestamp;
+        totalAmountStakedInContract += amount;
 
         bool success = IERC20(token).transferFrom(msg.sender, address(this), amount);
         if (!success) {
@@ -187,28 +195,94 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
      * The function is used to withdraw a stake position.
      * We need to ensure that the minimum lock period has passed.
      */
-    function withdrawFromPosition(uint256 stakeId, uint256 amount)
-        public
-        notPaused
-        moreThanZero(amount)
-        preexistentStakes
-    {
-        if (amount > _stakes[msg.sender][stakeId].size) {
-            revert StakeERC20__NotEnoughBalance();
+    function withdrawPosition(uint256 stakeId) public notPaused preexistentStakes nonReentrant {
+        Stake memory stake = _stakes[msg.sender][stakeId];
+        if (stake.size == 0) {
+            revert StakeERC20__NoStakeToWithdraw();
+        }
+        if (block.timestamp - stake.startTime < stakeLockPeriod) revert StakeERC20__UnstakingPeriodNotPassed();
+
+        uint256 totalRewards = _calculateRewards(msg.sender, stakeId) + stake.rewardAquired;
+        uint256 totalAmount = totalRewards + stake.size;
+        totalAmountStakedInContract -= stake.size;
+
+        delete _stakes[msg.sender][stakeId];
+
+        bool success = token.transfer(msg.sender, totalAmount);
+        if (!success) {
+            revert StakeERC20__TransferFailed();
         }
     }
 
-    function withdrawAll() public {}
-
-    function claimRewards() external {}
-
-    function setRewardRate() public onlyOwner {}
-
-    function forceWithdraw() public onlyOwner {}
-
-    function changeLockPeriod() public onlyOwner {}
+    /**
+     * Let a user withdraw all stake positions with one click
+     * Only positions with minimum lock period satisfied
+     */
+    function withdrawAll() public preexistentStakes notPaused {
+        uint256 totalReward;
+        uint256 totalStakedAmount;
+        for (uint256 i = 0; i <= _stakeCount[msg.sender]; i++) {
+            Stake memory stake = _stakes[msg.sender][i];
+            if (block.timestamp - stake.startTime >= stakeLockPeriod) {
+                totalReward = _calculateRewards(msg.sender, i) + stake.rewardAquired;
+                totalStakedAmount += stake.size;
+                totalAmountStakedInContract -= stake.size;
+                delete _stakes[msg.sender][i];
+            } else {
+                return;
+            }
+        }
+        uint256 amountToSend = totalReward + totalStakedAmount;
+        bool success = token.transferFrom(address(this), msg.sender, amountToSend);
+        if (!success) {
+            revert StakeERC20__TransferFailed();
+        }
+    }
 
     /**
+     * The function will calculate the reward and transfer them
+     * @param stakeId The id of the stake to claimReward from
+     */
+    function claimRewards(uint256 stakeId) external preexistentStakes notPaused {
+        Stake memory stake = _stakes[msg.sender][stakeId];
+        uint256 rewards = stake.rewardAquired + _calculateClaimRewards(msg.sender, stakeId);
+
+        stake.rewardAquired = 0;
+        stake.lastClaimedRewards = block.timestamp;
+
+        bool success = token.transferFrom(address(this), msg.sender, rewards);
+        if (!success) {
+            revert StakeERC20__TransferFailed();
+        }
+    }
+
+    /**
+     * A function that will send back all the funds along with aquired rewards.
+     * Owner can use it anytime, bypassing minimum lock period.
+     */
+    function forceWithdraw() public onlyOwner {
+        for (uint256 i = 0; i <= users.length; i++) {
+            uint256 userTotalStaked;
+            uint256 reward;
+            for (uint256 j = 0; j <= _stakeCount[users[i]]; j++) {
+                reward = _stakes[users[i]][j].rewardAquired + _calculateClaimRewards(msg.sender, _stakeCount[users[i]]);
+                userTotalStaked += _stakes[users[i]][j].size;
+            }
+            uint256 totalAmount = userTotalStaked + reward;
+            token.transferFrom(address(this), address(users[i]), totalAmount);
+        }
+    }
+
+    function setRewardRate(uint256 newReward) public onlyOwner {
+        rewardRate = newReward;
+    }
+
+    function changeLockPeriod(uint256 newLockPeriod) public onlyOwner {
+        stakeLockPeriod = newLockPeriod;
+    }
+
+    /**
+     * @dev This function is intended to be used for withdraw functions
      * This function will calculate de rewards for a stake position
      * @param user Which used to calculate for
      * @param stakeId The individual id position of the user
@@ -216,6 +290,18 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
     function _calculateRewards(address user, uint256 stakeId) internal view returns (uint256) {
         Stake memory stakePosition = _stakes[user][stakeId];
         uint256 stakedTimeInYears = (block.timestamp - stakePosition.startTime) / SECONDS_IN_A_YEAR;
+        uint256 reward = (stakePosition.size * rewardRate * stakedTimeInYears) / 100;
+        return reward;
+    }
+
+    /**
+     * @dev This function is intended to be used for claimRewards and forceWithdraw function
+     * @param user Which used to calculate for
+     * @param stakeId The individual id position of the user
+     */
+    function _calculateClaimRewards(address user, uint256 stakeId) internal view returns (uint256) {
+        Stake memory stakePosition = _stakes[user][stakeId];
+        uint256 stakedTimeInYears = (block.timestamp - stakePosition.lastClaimedRewards) / SECONDS_IN_A_YEAR;
         uint256 reward = (stakePosition.size * rewardRate * stakedTimeInYears) / 100;
         return reward;
     }
