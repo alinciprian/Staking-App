@@ -20,12 +20,13 @@
 // view & pure functions
 
 //SPDX-License-Identifier: MIT
-pragma solidity ^0.8.18;
+pragma solidity ^0.8.20;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IStakeERC20} from "./interfaces/IStakeERC20.sol";
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {UD60x18, ud} from "../lib/prb-math/src/UD60x18.sol";
 
 /**
  * @title : StakeERC20 contract
@@ -56,6 +57,8 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
     /// @notice Thrown when trying to addToStakePosition, but use has none
     error StakeERC20__NoStakePositionAvalible();
 
+    error StakeERC20__PositionDoesNotExist();
+
     /*//////////////////////////////////////////////////////////////////////////
                                 PUBLIC CONSTANTS
     //////////////////////////////////////////////////////////////////////////*/
@@ -68,9 +71,9 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
 
     struct Stake {
         uint256 size;
-        uint256 startTime;
         uint256 rewardAquired;
-        uint256 lastClaimedRewards;
+        uint40 startTime; //convert to uint40
+        uint40 lastClaimedRewards; //convert to uint40
     }
 
     IERC20 public token;
@@ -109,9 +112,9 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
         _;
     }
 
-    modifier preexistentStakes() {
-        if (_stakeCount[msg.sender] == 0) {
-            revert StakeERC20__NoStakePositionAvalible();
+    modifier existentStakes(uint256 stakeId) {
+        if (_stakes[msg.sender][stakeId].size == 0) {
+            revert StakeERC20__PositionDoesNotExist();
         }
 
         _;
@@ -147,13 +150,15 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
             revert StakeERC20__NotEnoughBalance();
         }
 
-        Stake memory stakePosition = _stakes[msg.sender][_stakeCount[msg.sender]];
-        stakePosition.size += amount;
-        stakePosition.startTime = block.timestamp;
-        stakePosition.lastClaimedRewards = block.timestamp;
-        _stakeCount[msg.sender] += 1;
+        Stake memory stake = _stakes[msg.sender][_stakeCount[msg.sender]];
+        stake.size += amount;
+        stake.startTime = uint40(block.timestamp);
+        stake.lastClaimedRewards = uint40(block.timestamp);
         totalAmountStakedInContract += amount;
         users.push(msg.sender);
+        unchecked {
+            _stakeCount[msg.sender]++;
+        }
 
         bool success = IERC20(token).transferFrom(msg.sender, address(this), amount);
         if (!success) {
@@ -173,16 +178,16 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
         public
         notPaused
         moreThanZero(amount)
-        preexistentStakes
+        existentStakes(stakeId)
     {
         if (IERC20(token).balanceOf(msg.sender) < amount) {
             revert StakeERC20__NotEnoughBalance();
         }
 
-        Stake memory stakePosition = _stakes[msg.sender][stakeId];
-        stakePosition.rewardAquired = _calculateRewards(msg.sender, stakeId);
-        stakePosition.size += amount;
-        stakePosition.startTime = block.timestamp;
+        Stake memory stake = _stakes[msg.sender][stakeId];
+        stake.rewardAquired = _calculateRewards(msg.sender, stakeId, stake.startTime);
+        stake.size += amount;
+        stake.startTime = uint40(block.timestamp);
         totalAmountStakedInContract += amount;
 
         bool success = IERC20(token).transferFrom(msg.sender, address(this), amount);
@@ -195,14 +200,14 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
      * The function is used to withdraw a stake position.
      * We need to ensure that the minimum lock period has passed.
      */
-    function withdrawPosition(uint256 stakeId) public notPaused preexistentStakes nonReentrant {
+    function withdrawPosition(uint256 stakeId) public notPaused existentStakes(stakeId) nonReentrant {
         Stake memory stake = _stakes[msg.sender][stakeId];
         if (stake.size == 0) {
             revert StakeERC20__NoStakeToWithdraw();
         }
         if (block.timestamp - stake.startTime < stakeLockPeriod) revert StakeERC20__UnstakingPeriodNotPassed();
 
-        uint256 totalRewards = _calculateRewards(msg.sender, stakeId) + stake.rewardAquired;
+        uint256 totalRewards = _calculateRewards(msg.sender, stakeId, stake.startTime) + stake.rewardAquired;
         uint256 totalAmount = totalRewards + stake.size;
         totalAmountStakedInContract -= stake.size;
 
@@ -218,18 +223,15 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
      * Let a user withdraw all stake positions with one click
      * Only positions with minimum lock period satisfied
      */
-    function withdrawAll() public preexistentStakes notPaused {
+    function withdrawAll() public notPaused {
         uint256 totalReward;
         uint256 totalStakedAmount;
-        for (uint256 i = 0; i <= _stakeCount[msg.sender]; i++) {
+        for (uint256 i; i < _stakeCount[msg.sender]; ++i) {
             Stake memory stake = _stakes[msg.sender][i];
             if (block.timestamp - stake.startTime >= stakeLockPeriod) {
-                totalReward = _calculateRewards(msg.sender, i) + stake.rewardAquired;
+                totalReward = _calculateRewards(msg.sender, i, stake.startTime) + stake.rewardAquired;
                 totalStakedAmount += stake.size;
-                totalAmountStakedInContract -= stake.size;
                 delete _stakes[msg.sender][i];
-            } else {
-                return;
             }
         }
         uint256 amountToSend = totalReward + totalStakedAmount;
@@ -243,12 +245,12 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
      * The function will calculate the reward and transfer them
      * @param stakeId The id of the stake to claimReward from
      */
-    function claimRewards(uint256 stakeId) external preexistentStakes notPaused {
+    function claimRewards(uint256 stakeId) external existentStakes(stakeId) notPaused {
         Stake memory stake = _stakes[msg.sender][stakeId];
-        uint256 rewards = stake.rewardAquired + _calculateClaimRewards(msg.sender, stakeId);
+        uint256 rewards = stake.rewardAquired + _calculateRewards(msg.sender, stakeId, stake.lastClaimedRewards);
 
         stake.rewardAquired = 0;
-        stake.lastClaimedRewards = block.timestamp;
+        stake.lastClaimedRewards = uint40(block.timestamp);
 
         bool success = token.transferFrom(address(this), msg.sender, rewards);
         if (!success) {
@@ -265,7 +267,8 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
             uint256 userTotalStaked;
             uint256 reward;
             for (uint256 j = 0; j <= _stakeCount[users[i]]; j++) {
-                reward = _stakes[users[i]][j].rewardAquired + _calculateClaimRewards(msg.sender, _stakeCount[users[i]]);
+                reward = _stakes[users[i]][j].rewardAquired
+                    + _calculateRewards(msg.sender, _stakeCount[users[i]], _stakes[users[i]][j].startTime);
                 userTotalStaked += _stakes[users[i]][j].size;
             }
             uint256 totalAmount = userTotalStaked + reward;
@@ -287,22 +290,10 @@ contract StakeERC20 is ReentrancyGuard, Ownable {
      * @param user Which used to calculate for
      * @param stakeId The individual id position of the user
      */
-    function _calculateRewards(address user, uint256 stakeId) internal view returns (uint256) {
-        Stake memory stakePosition = _stakes[user][stakeId];
-        uint256 stakedTimeInYears = (block.timestamp - stakePosition.startTime) / SECONDS_IN_A_YEAR;
-        uint256 reward = (stakePosition.size * rewardRate * stakedTimeInYears) / 100;
-        return reward;
-    }
-
-    /**
-     * @dev This function is intended to be used for claimRewards and forceWithdraw function
-     * @param user Which used to calculate for
-     * @param stakeId The individual id position of the user
-     */
-    function _calculateClaimRewards(address user, uint256 stakeId) internal view returns (uint256) {
-        Stake memory stakePosition = _stakes[user][stakeId];
-        uint256 stakedTimeInYears = (block.timestamp - stakePosition.lastClaimedRewards) / SECONDS_IN_A_YEAR;
-        uint256 reward = (stakePosition.size * rewardRate * stakedTimeInYears) / 100;
+    function _calculateRewards(address user, uint256 stakeId, uint40 endTime) internal view returns (uint256) {
+        Stake memory stake = _stakes[user][stakeId];
+        uint256 stakedTimeInYears = (block.timestamp - endTime) / SECONDS_IN_A_YEAR;
+        uint256 reward = (stake.size * rewardRate * stakedTimeInYears) / 100;
         return reward;
     }
 }

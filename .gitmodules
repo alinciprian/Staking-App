@@ -1,0 +1,3 @@
+[submodule "smart-contracts/lib/prb-math"]
+	path = smart-contracts/lib/prb-math
+	url = https://github.com/PaulRBerg/prb-math
